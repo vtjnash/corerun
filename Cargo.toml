@@ -2,5 +2,14 @@
 name = "corerun"
 version = "0.1.0"
 edition = "2024"
+description = "A Rust command line application for core operations"
+license = "MIT"
+authors = ["Jameson Nash <vtjnash@gmail.com>"]
+homepage = "https://github.com/example/corerun"
+repository = "https://github.com/example/corerun"
+readme = "README.md"
+keywords = ["cli", "command-line", "tool"]
+categories = ["command-line-utilities"]
 
 [dependencies]
+clap = { version = "4.0", features = ["derive"] }
