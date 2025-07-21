@@ -5,10 +5,18 @@ use mach2::task::task_threads;
 use mach2::thread_act::{thread_suspend, thread_set_state};
 use mach2::traps::mach_task_self;
 use mach2::vm::mach_vm_deallocate;
+use mach2::bootstrap::bootstrap_look_up;
+use mach2::task::{TASK_BOOTSTRAP_PORT, task_get_special_port};
+use mach2::message::{
+    MACH_MSGH_BITS, MACH_MSG_TYPE_COPY_SEND, MACH_MSGH_BITS_COMPLEX,
+    mach_msg_send, mach_msg_header_t, mach_msg_body_t, mach_msg_port_descriptor_t
+};
+use mach2::port::{mach_port_t, MACH_PORT_NULL};
 use std::os::fd::{RawFd, FromRawFd};
 use std::fs::File;
 use std::io::Read;
 use std::thread;
+use std::ffi::CString;
 
 #[derive(Debug)]
 #[repr(C)]
@@ -17,11 +25,77 @@ struct IpcCommand {
     data_length: u32,
 }
 
+/// The message format that the child sends to the parent.
+#[repr(C)]
+struct SendMessage {
+    header: mach_msg_header_t,
+    body: mach_msg_body_t,
+    task_port: mach_msg_port_descriptor_t,
+}
+
+/// A wrapper for a `mach_port_t` to deallocate the port on drop.
+struct MachPort(mach_port_t);
+
+impl Drop for MachPort {
+    fn drop(&mut self) {
+        unsafe {
+            mach_port_deallocate(mach_task_self(), self.0);
+        }
+    }
+}
+
 const IPC_CMD_UNMAP_ALL: u32 = 1;
 const IPC_CMD_MAP_SEGMENT: u32 = 2;
-const IPC_CMD_SUSPEND_THREADS: u32 = 3;
+const IPC_CMD_GET_TASK_PORT: u32 = 4;
+const IPC_CMD_LAUNCH_N_THREADS: u32 = 5;
+
+/// Send our task port to the parent via bootstrap server
+fn send_task_port_to_parent(service_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let name = CString::new(service_name)?;
+    
+    unsafe {
+        // Look up the registered port in bootstrap server
+        let mut bootstrap_port: mach_port_t = std::mem::zeroed();
+        let kr = task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &mut bootstrap_port);
+        if kr != KERN_SUCCESS {
+            return Err(format!("task_get_special_port failed: {:x}", kr).into());
+        }
+
+        let mut parent_port: mach_port_t = std::mem::zeroed();
+        let kr = bootstrap_look_up(bootstrap_port, name.as_ptr(), &mut parent_port);
+        if kr != KERN_SUCCESS {
+            return Err(format!("bootstrap_look_up failed: {:x}", kr).into());
+        }
+        let parent_port = MachPort(parent_port);
+        
+        let child_task = mach_task_self();
+        
+        // Send our task port to the parent
+        let mut msg = SendMessage {
+            header: mach_msg_header_t {
+                msgh_bits: MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_COPY_SEND) | MACH_MSGH_BITS_COMPLEX,
+                msgh_size: std::mem::size_of::<SendMessage>() as u32,
+                msgh_remote_port: parent_port.0,
+                msgh_local_port: child_task,
+                msgh_voucher_port: MACH_PORT_NULL,
+                msgh_id: 0,
+            },
+            body: mach_msg_body_t { msgh_descriptor_count: 1 },
+            task_port: mach_msg_port_descriptor_t::new(child_task, MACH_MSG_TYPE_COPY_SEND),
+        };
+        
+        let kr = mach_msg_send(&mut msg.header);
+        if kr != KERN_SUCCESS {
+            return Err(format!("mach_msg_send failed: {:x}", kr).into());
+        }
+    }
+    
+    Ok(())
+}
 
 fn handle_ipc_commands(ipc_fd: RawFd, coredump_fd: RawFd) {
+    // Storage for created threads
+    let mut created_threads: Vec<thread::JoinHandle<()>> = Vec::new();
     // Sleep for 1 second to give time to attach lldb
     std::thread::sleep(std::time::Duration::from_secs(1));
     
@@ -106,7 +180,7 @@ fn handle_ipc_commands(ipc_fd: RawFd, coredump_fd: RawFd) {
                         let mut prot = 0;
                         if protection & 1 != 0 { prot |= libc::PROT_READ; }
                         if protection & 2 != 0 { prot |= libc::PROT_WRITE; }
-                        //if protection & 4 != 0 { prot |= libc::PROT_EXEC; }
+                        if protection & 4 != 0 { prot |= libc::PROT_EXEC; }
                         
                         // Map the segment directly from the coredump file
                         let mapped_addr = libc::mmap(
@@ -134,105 +208,49 @@ fn handle_ipc_commands(ipc_fd: RawFd, coredump_fd: RawFd) {
                     }
                 }
             },
-            IPC_CMD_SUSPEND_THREADS => {
-                unsafe {
-                    let task = mach_task_self();
-                    let mut threads: *mut thread_act_t = std::ptr::null_mut();
-                    let mut thread_count: u32 = 0;
-
-                    // Parse serialized thread state data if present
-                    let mut all_thread_states = Vec::new();
-                    let mut max_thread_id = 0u32;
-                    if !command_data.is_empty() {
-                        // Parse serialized thread states from command_data
-                        let mut offset = 0;
-                        while offset + 16 <= command_data.len() { // 4 u32s minimum
-                            let thread_id = u32::from_le_bytes([
-                                command_data[offset], command_data[offset + 1],
-                                command_data[offset + 2], command_data[offset + 3]
-                            ]);
-                            let flavor = u32::from_le_bytes([
-                                command_data[offset + 4], command_data[offset + 5],
-                                command_data[offset + 6], command_data[offset + 7]
-                            ]);
-                            let count = u32::from_le_bytes([
-                                command_data[offset + 8], command_data[offset + 9],
-                                command_data[offset + 10], command_data[offset + 11]
-                            ]);
-                            let data_size = u32::from_le_bytes([
-                                command_data[offset + 12], command_data[offset + 13],
-                                command_data[offset + 14], command_data[offset + 15]
-                            ]);
-                            
-                            offset += 16;
-                            
-                            if offset + data_size as usize <= command_data.len() {
-                                let state_data = &command_data[offset..offset + data_size as usize];
-                                all_thread_states.push((thread_id, flavor, count, state_data));
-                                max_thread_id = max_thread_id.max(thread_id);
-                                offset += data_size as usize;
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-
-                    // Create additional threads to match the expected thread count
-                    // We need max_thread_id+1 total threads, and we already have 1 (this IPC thread)
-                    let threads_to_create = if max_thread_id > 0 { max_thread_id } else { 0 };
-                    let mut created_threads = Vec::new();
+            IPC_CMD_LAUNCH_N_THREADS => {
+                // Launch N threads as requested
+                if command.data_length >= 4 {
+                    let thread_count = u32::from_le_bytes([
+                        command_data[0], command_data[1], command_data[2], command_data[3]
+                    ]);
                     
-                    for thread_idx in 0..threads_to_create {
-                        let handle = std::thread::spawn(move || {
+                    eprintln!("Launching {} threads", thread_count);
+                    
+                    // Create the requested number of threads
+                    for thread_idx in 0..thread_count {
+                        let handle = thread::spawn(move || {
                             // Block and do nothing - just exist to match thread count
                             loop {
-                                std::thread::park();
+                                thread::park();
                             }
                         });
                         created_threads.push(handle);
                         eprintln!("Created thread {}", thread_idx);
                     }
-
-                    // Get all threads in the task
-                    let result = task_threads(task, &mut threads, &mut thread_count);
-                    if result == KERN_SUCCESS {
-                        // Suspend each thread except the current one (this IPC handler)
-                        let current_thread = mach2::mach_init::mach_thread_self();
-                        for i in 0..thread_count {
-                            let thread = *threads.offset(i as isize);
-                            if thread != current_thread {
-                                thread_suspend(thread);
-                                
-                                // Set thread state from parsed data
-                                for (state_idx, &(thread_id, flavor, count, state_data)) in all_thread_states.iter().enumerate() {
-                                    if (thread_id == i) {
-                                        let state_result = thread_set_state(
-                                            thread,
-                                            flavor as i32,
-                                            state_data.as_ptr() as *mut u32,
-                                            count,
-                                        );
-                                        if state_result != KERN_SUCCESS {
-                                            eprintln!("Failed to set thread state {} (thread_id: {}) for thread {}: {}", state_idx, thread_id, i, state_result);
-                                        } else {
-                                            eprintln!("Set thread state {} (thread_id: {}) for thread {}: flavor=0x{:x}, count={}", 
-                                                    state_idx, thread_id, i, flavor, count);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Clean up the threads array with mach_vm_deallocate
-                        mach_vm_deallocate(
-                            task,
-                            threads as u64,
-                            (thread_count as usize * std::mem::size_of::<thread_act_t>()) as u64,
-                        );
-                        
-                        // Deallocate the current_thread port
-                        mach_port_deallocate(task, current_thread);
+                } else {
+                    eprintln!("Launch threads command received but no thread count provided");
+                }
+            },
+            IPC_CMD_GET_TASK_PORT => {
+                // Task port requested with service name in command_data
+                if command.data_length > 0 {
+                    let service_name = String::from_utf8_lossy(&command_data);
+                    eprintln!("Task port requested for service: {}", service_name);
+                    
+                    // Close the IPC file and coredump file
+                    drop(ipc_file);
+                    unsafe { libc::close(coredump_fd); }
+                    
+                    // Send our task port to the parent via the provided service name
+                    if let Err(e) = send_task_port_to_parent(&service_name) {
+                        eprintln!("Failed to send task port to parent: {}", e);
                     }
+                    
+                    // Stop handling IPC commands after sending task port
+                    return;
+                } else {
+                    eprintln!("Task port requested but no service name provided");
                 }
             },
             _ => {
@@ -255,13 +273,11 @@ fn main() {
     let coredump_fd_exists = unsafe { libc::fcntl(3, libc::F_GETFD) != -1 };
     
     if ipc_fd_exists && coredump_fd_exists {
-        // Spawn a thread to handle IPC commands
-        thread::spawn(|| {
-            handle_ipc_commands(4, 3);
-        });
+        // Handle IPC commands in main thread
+        handle_ipc_commands(4, 3);
     }
 
-    // Infinite loop - the parent process will send commands via IPC
+    // After IPC handling ends (when task port is sent), enter infinite loop
     loop {
         // Yield to avoid consuming too much CPU
         std::thread::yield_now();

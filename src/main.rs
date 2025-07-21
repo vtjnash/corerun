@@ -16,6 +16,10 @@ use process_control::ProcessController;
 /// 
 /// This function implements a core dump runner that recreates process memory
 /// from MachO files by parsing segments and mapping them into a new process.
+/// 
+/// Note: To generate coredumps on macOS, the target process needs the
+/// "com.apple.security.get-task-allow" entitlement. This is automatically
+/// granted for debug builds but may need to be explicitly added for release builds.
 fn main() {
     let matches = Command::new("corerun")
         .author("Jameson Nash <vtjnash@gmail.com>")
@@ -129,8 +133,60 @@ fn main() {
         }
     };
 
+    // Step 3.5: Launch required number of threads if we have thread commands
+    if !thread_commands.is_empty() {
+        let thread_count = thread_commands.len() as u32;
+        if verbose {
+            println!("Launching {} threads in target process...", thread_count);
+        }
+        
+        if let Err(e) = process_controller.launch_n_threads(thread_count) {
+            eprintln!("Error: Failed to launch threads: {}", e);
+            process::exit(1);
+        }
+    }
+
+    // Step 3.6: Get task port for memory operations
     if verbose {
-        println!("Target process spawned with PID: {}", process_controller.get_pid());
+        println!("Retrieving task port...");
+    }
+    
+    let child_pid = process_controller.get_pid();
+    if verbose {
+        println!("Target process spawned with PID: {}", child_pid);
+    }
+    
+    // Get task port - this will now work with the full IPC implementation
+    match process_controller.get_task_port() {
+        Ok(task_port) => {
+            if verbose {
+                println!("Target process task_port: {}", task_port);
+                
+                // Verify task_port corresponds to the correct PID
+                unsafe extern "C" {
+                    fn pid_for_task(task: mach2::port::mach_port_t, pid: *mut libc::c_int) -> mach2::kern_return::kern_return_t;
+                }
+                
+                unsafe {
+                    let mut extracted_pid: libc::c_int = 0;
+                    let kr = pid_for_task(task_port, &mut extracted_pid);
+                    if kr == mach2::kern_return::KERN_SUCCESS {
+                        if extracted_pid as u32 == child_pid {
+                            println!("✅ Task port verification successful: pid_for_task({}) == {}", task_port, extracted_pid);
+                        } else {
+                            println!("❌ Task port verification failed: pid_for_task({}) returned {} but expected {}", 
+                                     task_port, extracted_pid, child_pid);
+                        }
+                    } else {
+                        println!("❌ Task port verification failed: pid_for_task returned error 0x{:x}", kr);
+                    }
+                }
+            }
+        },
+        Err(e) => {
+            eprintln!("Error: Failed to retrieve task port: {}", e);
+            process::exit(1);
+        }
     }
 
     // Step 4: Suspend all threads in the target process
@@ -156,7 +212,7 @@ fn main() {
         println!("Unmapping existing process memory...");
     }
     
-    if let Err(e) = process_controller.unmap_all_memory() {
+    if let Err(e) = process_controller.unmap_all_memory(verbose) {
         eprintln!("Error: Failed to unmap memory: {}", e);
         process::exit(1);
     }
@@ -166,7 +222,7 @@ fn main() {
         println!("Mapping segments from coredump...");
     }
     
-    if let Err(e) = process_controller.map_segments(&segments) {
+    if let Err(e) = process_controller.map_segments(&segments, coredump_file.as_raw_fd(), verbose) {
         eprintln!("Error: Failed to map segments: {}", e);
         process::exit(1);
     }
