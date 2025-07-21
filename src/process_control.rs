@@ -18,11 +18,11 @@ use mach2::message::{
 use mach2::port::{mach_port_t, MACH_PORT_NULL, MACH_PORT_RIGHT_RECEIVE};
 use mach2::task::{TASK_BOOTSTRAP_PORT, task_get_special_port};
 use mach2::traps::mach_task_self;
-use mach2::vm::{mach_vm_deallocate, mach_vm_map, mach_vm_region, mach_vm_remap, mach_vm_protect};
+use mach2::vm::{mach_vm_deallocate, mach_vm_map, mach_vm_region, mach_vm_remap, mach_vm_protect, mach_vm_copy};
 use mach2::vm_region::{vm_region_basic_info_64, vm_region_basic_info_64_t, VM_REGION_BASIC_INFO_64};
 use mach2::vm_statistics::{VM_FLAGS_FIXED, VM_FLAGS_OVERWRITE};
 use mach2::vm_inherit::VM_INHERIT_SHARE;
-use mach2::vm_prot::{VM_PROT_READ, VM_PROT_WRITE, VM_PROT_EXECUTE};
+use mach2::vm_prot::{VM_PROT_READ, VM_PROT_WRITE, VM_PROT_EXECUTE, VM_PROT_ALL};
 use std::mem;
 use std::ffi::CString;
 use uuid::Uuid;
@@ -315,45 +315,95 @@ impl ProcessController {
                     VM_INHERIT_SHARE,             // inheritance
                 );
 
-                if remap_kr == KERN_SUCCESS {
-                    // Adjust protection if it doesn't match desired
-                    if cur_protection != desired_vm_prot {
-                        remap_kr = mach_vm_protect(
-                            task_port,
-                            child_mapped_address,
-                            segment.vm_size,
-                            0, // set_maximum = false
-                            desired_vm_prot,
-                        );
-                        if remap_kr == KERN_SUCCESS {
-                            cur_protection = desired_vm_prot; // Update for debug print
+                if remap_kr != KERN_SUCCESS {
+                    if verbose {
+                        println!("⚠️  mach_vm_remap failed for segment {} from 0x{:x} at 0x{:x}-0x{:x}: size: 0x{:x}, error 0x{:x}", 
+                                segment.name, parent_mapped as u64, segment.vm_address, segment.vm_address + segment.vm_size, segment.vm_size, remap_kr);
+                        println!("🔄 Trying fallback: mach_vm_map + vm_copy for segment {}", segment.name);
+                    }
+                    
+                    // Fallback: try mach_vm_map + vm_copy
+                    let mut fallback_address = segment.vm_address;
+                    cur_protection = VM_PROT_READ | VM_PROT_WRITE;
+                    max_protection = VM_PROT_ALL;
+                    let map_kr = unsafe {
+                        mach_vm_map(
+                            task_port,                    // target_task (child)
+                            &mut fallback_address,        // address
+                            segment.vm_size,              // size
+                            0,                            // mask
+                            VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, // flags
+                            MACH_PORT_NULL,               // object
+                            0,                            // offset
+                            0,                            // copy
+                            cur_protection,               // cur_protection
+                            VM_PROT_ALL,                  // max_protection
+                            VM_INHERIT_SHARE,             // inheritance
+                        )
+                    };
+                    
+                    if map_kr == KERN_SUCCESS {
+                        // Now copy the data using mach_vm_copy
+                        let copy_kr = unsafe {
+                            mach_vm_copy(
+                                task_port,                // dest_task (child)
+                                fallback_address,         // dest_address
+                                parent_mapped as u64,     // src_address
+                                segment.vm_size,          // size
+                            )
+                        };
+                        
+                        if copy_kr == KERN_SUCCESS {
+                            if verbose {
+                                println!("✅ Fallback successful: mapped and copied segment {} at 0x{:x}, size: 0x{:x}", 
+                                        segment.name, fallback_address, segment.vm_size);
+                            }
                         } else {
-                            println!("⚠️  Failed to adjust protection for segment {}: error 0x{:x}", 
-                                    segment.name, remap_kr);
-                        }
-                    }
-                    
-                    if verbose || remap_kr != KERN_SUCCESS {
-                        // Debug: Print protection info after remap
-                        let desired_prot = if segment.init_protection & 1 != 0 { "R" } else { "-" }.to_string() +
-                                          if segment.init_protection & 2 != 0 { "W" } else { "-" } +
-                                          if segment.init_protection & 4 != 0 { "X" } else { "-" };
-                        println!("🔧 Protection debug - desired: {} (0x{:x}), cur: 0x{:x}, max: 0x{:x}", 
-                                desired_prot, segment.init_protection, cur_protection, max_protection);
-                    }
-                    
-                    if child_mapped_address == segment.vm_address {
-                        if verbose {
-                            println!("✅ Mapped segment {} at 0x{:x}, size: 0x{:x} (mach_vm_remap)", 
-                                    segment.name, child_mapped_address, segment.vm_size);
+                            println!("⚠️  mach_vm_copy failed for segment {} at 0x{:x}, size: 0x{:x}, error 0x{:x}", 
+                                    segment.name, fallback_address, segment.vm_size, copy_kr);
+                            continue;
                         }
                     } else {
-                        println!("⚠️  Segment {} mapped to 0x{:x} instead of 0x{:x}, size: 0x{:x} (mach_vm_remap)", 
-                                segment.name, child_mapped_address, segment.vm_address, segment.vm_size);
+                        println!("⚠️  Fallback mach_vm_map failed for segment {} at 0x{:x} (0x{:x}), size: 0x{:x}, error 0x{:x}", 
+                                segment.name, segment.vm_address, fallback_address, segment.vm_size, map_kr);
+                        continue;
+                    }
+                }
+
+                // Adjust protection if it doesn't match desired
+                if cur_protection != desired_vm_prot {
+                    remap_kr = mach_vm_protect(
+                        task_port,
+                        child_mapped_address,
+                        segment.vm_size,
+                        0, // set_maximum = false
+                        desired_vm_prot,
+                    );
+                    if remap_kr == KERN_SUCCESS {
+                        cur_protection = desired_vm_prot; // Update for debug print
+                    } else {
+                        println!("⚠️  Failed to adjust protection for segment {}: error 0x{:x}", 
+                                segment.name, remap_kr);
+                    }
+                }
+                
+                if verbose || remap_kr != KERN_SUCCESS {
+                    // Debug: Print protection info after remap
+                    let desired_prot = if segment.init_protection & 1 != 0 { "R" } else { "-" }.to_string() +
+                                        if segment.init_protection & 2 != 0 { "W" } else { "-" } +
+                                        if segment.init_protection & 4 != 0 { "X" } else { "-" };
+                    println!("🔧 Protection debug - desired: {} (0x{:x}), cur: 0x{:x}, max: 0x{:x}", 
+                            desired_prot, segment.init_protection, cur_protection, max_protection);
+                }
+                
+                if child_mapped_address == segment.vm_address {
+                    if verbose {
+                        println!("✅ Mapped segment {} at 0x{:x}, size: 0x{:x} (mach_vm_remap)", 
+                                segment.name, child_mapped_address, segment.vm_size);
                     }
                 } else {
-                    println!("⚠️  Failed to remap segment {} from 0x{:x} at 0x{:x}-0x{:x}: size: 0x{:x}, error 0x{:x}", 
-                            segment.name, parent_mapped as u64, segment.vm_address, segment.vm_address + segment.vm_size, segment.vm_size, remap_kr);
+                    println!("⚠️  Segment {} mapped to 0x{:x} instead of 0x{:x}, size: 0x{:x} (mach_vm_remap)", 
+                            segment.name, child_mapped_address, segment.vm_address, segment.vm_size);
                 }
                 
                 // No need to munmap since we're using the shared coredump_mmap
