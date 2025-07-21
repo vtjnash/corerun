@@ -97,7 +97,7 @@ fn handle_ipc_commands(ipc_fd: RawFd, coredump_fd: RawFd) {
     // Storage for created threads
     let mut created_threads: Vec<thread::JoinHandle<()>> = Vec::new();
     // Sleep for 1 second to give time to attach lldb
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    //std::thread::sleep(std::time::Duration::from_secs(1));
     
     // Convert raw FD to File for safe I/O
     let mut ipc_file = unsafe { File::from_raw_fd(ipc_fd) };
@@ -215,8 +215,6 @@ fn handle_ipc_commands(ipc_fd: RawFd, coredump_fd: RawFd) {
                         command_data[0], command_data[1], command_data[2], command_data[3]
                     ]);
                     
-                    eprintln!("Launching {} threads", thread_count);
-                    
                     // Create the requested number of threads
                     for thread_idx in 0..thread_count {
                         let handle = thread::spawn(move || {
@@ -226,7 +224,6 @@ fn handle_ipc_commands(ipc_fd: RawFd, coredump_fd: RawFd) {
                             }
                         });
                         created_threads.push(handle);
-                        eprintln!("Created thread {}", thread_idx);
                     }
                 } else {
                     eprintln!("Launch threads command received but no thread count provided");
@@ -236,7 +233,6 @@ fn handle_ipc_commands(ipc_fd: RawFd, coredump_fd: RawFd) {
                 // Task port requested with service name in command_data
                 if command.data_length > 0 {
                     let service_name = String::from_utf8_lossy(&command_data);
-                    eprintln!("Task port requested for service: {}", service_name);
                     
                     // Close the IPC file and coredump file
                     drop(ipc_file);

@@ -53,72 +53,67 @@ fn main() {
         println!("Parsing core dump file...");
     }
     
-    let (segments, thread_commands, coredump_file) = {
-        // Memory map the core dump file for efficient access
-        let coredump_file = match File::open(coredump_path) {
-            Ok(file) => file,
-            Err(e) => {
-                eprintln!("Error: Failed to open coredump file '{}': {}", coredump_path, e);
-                process::exit(1);
-            }
-        };
+    // Memory map the core dump file for efficient access
+    let coredump_file = match File::open(coredump_path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("Error: Failed to open coredump file '{}': {}", coredump_path, e);
+            process::exit(1);
+        }
+    };
+    
+    let coredump_mmap = match unsafe { MmapOptions::new().map_copy(&coredump_file) } {
+        Ok(mmap) => mmap,
+        Err(e) => {
+            eprintln!("Error: Failed to mmap coredump file '{}': {}", coredump_path, e);
+            process::exit(1);
+        }
+    };
+    
+    let parser = match CoreFileParser::new(&coredump_mmap) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error: Failed to parse coredump file '{}': {}", coredump_path, e);
+            process::exit(1);
+        }
+    };
+
+    let segments = match parser.parse_segments() {
+        Ok(segments) => segments,
+        Err(e) => {
+            eprintln!("Error: Failed to parse core dump segments: {}", e);
+            process::exit(1);
+        }
+    };
+
+    let thread_commands = match parser.parse_thread_states() {
+        Ok(cmds) => cmds,
+        Err(e) => {
+            eprintln!("Error: Failed to parse thread commands: {}", e);
+            process::exit(1);
+        }
+    };
+
+    if verbose {
+        println!("Core dump file type: {:?}", parser.get_kind());
+        println!("Entry point: 0x{:x}", parser.get_entry_point());
         
-        let coredump_mmap = match unsafe { MmapOptions::new().map(&coredump_file) } {
-            Ok(mmap) => mmap,
-            Err(e) => {
-                eprintln!("Error: Failed to mmap coredump file '{}': {}", coredump_path, e);
-                process::exit(1);
-            }
-        };
+        println!("Found {} segments:", segments.len());
+        for segment in &segments {
+            println!("  {} - addr: 0x{:x}, size: 0x{:x}, offset: 0x{:x}, prot: max=0x{:x} init=0x{:x}", 
+                     segment.name, segment.vm_address, segment.vm_size, segment.file_offset,
+                     segment.max_protection, segment.init_protection);
+        }
         
-        let parser = match CoreFileParser::new(&coredump_mmap) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("Error: Failed to parse coredump file '{}': {}", coredump_path, e);
-                process::exit(1);
-            }
-        };
-
-        let segments = match parser.parse_segments() {
-            Ok(segments) => segments,
-            Err(e) => {
-                eprintln!("Error: Failed to parse core dump segments: {}", e);
-                process::exit(1);
-            }
-        };
-
-        let thread_commands = match parser.parse_thread_states() {
-            Ok(cmds) => cmds,
-            Err(e) => {
-                eprintln!("Error: Failed to parse thread commands: {}", e);
-                process::exit(1);
-            }
-        };
-
-        if verbose {
-            println!("Core dump file type: {:?}", parser.get_kind());
-            println!("Entry point: 0x{:x}", parser.get_entry_point());
-            
-            println!("Found {} segments:", segments.len());
-            for segment in &segments {
-                println!("  {} - addr: 0x{:x}, size: 0x{:x}, offset: 0x{:x}, prot: max=0x{:x} init=0x{:x}", 
-                         segment.name, segment.vm_address, segment.vm_size, segment.file_offset,
-                         segment.max_protection, segment.init_protection);
-            }
-            
-            println!("Found {} thread commands:", thread_commands.len());
-            for (i, thread_cmd) in thread_commands.iter().enumerate() {
-                println!("  Thread command {}: {} thread states", i, thread_cmd.thread_states.len());
-                for (j, state) in thread_cmd.thread_states.iter().enumerate() {
-                    println!("  State {}:", j);
-                    print!("{}", parser.format_thread_state_verbose(state));
-                }
+        println!("Found {} thread commands:", thread_commands.len());
+        for (i, thread_cmd) in thread_commands.iter().enumerate() {
+            println!("  Thread command {}: {} thread states", i, thread_cmd.thread_states.len());
+            for (j, state) in thread_cmd.thread_states.iter().enumerate() {
+                println!("  State {}:", j);
+                print!("{}", parser.format_thread_state_verbose(state));
             }
         }
-
-        // coredump_mmap and parser lifetimes end here
-        (segments, thread_commands, coredump_file)
-    };
+    }
 
     // Step 3: Spawn the target process
     if verbose {
@@ -135,7 +130,7 @@ fn main() {
 
     // Step 3.5: Launch required number of threads if we have thread commands
     if !thread_commands.is_empty() {
-        let thread_count = thread_commands.len() as u32;
+        let thread_count = thread_commands.len() as u32 - 1;
         if verbose {
             println!("Launching {} threads in target process...", thread_count);
         }
@@ -194,17 +189,9 @@ fn main() {
         println!("Suspending target process threads...");
     }
     
-    // Use thread state data if available, otherwise just suspend
-    if !thread_commands.is_empty() {
-        if let Err(e) = process_controller.suspend_threads_with_state(&thread_commands) {
-            eprintln!("Error: Failed to suspend threads with state: {}", e);
-            process::exit(1);
-        }
-    } else {
-        if let Err(e) = process_controller.suspend_all_threads() {
-            eprintln!("Error: Failed to suspend threads: {}", e);
-            process::exit(1);
-        }
+    if let Err(e) = process_controller.suspend_threads_with_state(&thread_commands, verbose) {
+        eprintln!("Error: Failed to suspend threads with state: {}", e);
+        process::exit(1);
     }
 
     // Step 5: Unmap existing memory
@@ -222,7 +209,7 @@ fn main() {
         println!("Mapping segments from coredump...");
     }
     
-    if let Err(e) = process_controller.map_segments(&segments, coredump_file.as_raw_fd(), verbose) {
+    if let Err(e) = process_controller.map_segments(&segments, &coredump_mmap, verbose) {
         eprintln!("Error: Failed to map segments: {}", e);
         process::exit(1);
     }

@@ -5,6 +5,7 @@ use std::os::fd::{RawFd, AsRawFd};
 use std::fs::File;
 use command_fds::{CommandFdExt, FdMapping};
 use std::process::{Command, Stdio, Child};
+use memmap2::MmapMut;
 use crate::core_file_parser::{SegmentInfo, ThreadCommand};
 use mach2::bootstrap::bootstrap_look_up;
 use mach2::kern_return::{KERN_SUCCESS, KERN_INVALID_ADDRESS};
@@ -19,6 +20,7 @@ use mach2::task::{TASK_BOOTSTRAP_PORT, task_get_special_port};
 use mach2::traps::mach_task_self;
 use mach2::vm::{mach_vm_deallocate, mach_vm_map, mach_vm_region, mach_vm_remap, mach_vm_protect};
 use mach2::vm_region::{vm_region_basic_info_64, vm_region_basic_info_64_t, VM_REGION_BASIC_INFO_64};
+use mach2::vm_statistics::{VM_FLAGS_FIXED, VM_FLAGS_OVERWRITE};
 use mach2::vm_inherit::VM_INHERIT_SHARE;
 use mach2::vm_prot::{VM_PROT_READ, VM_PROT_WRITE, VM_PROT_EXECUTE};
 use std::mem;
@@ -152,43 +154,7 @@ impl ProcessController {
         }, &thread_count_bytes)
     }
     
-    pub fn suspend_all_threads(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // Get the task port first
-        let task_port = self.get_task_port()?;
-        
-        unsafe {
-            let mut threads: *mut mach2::mach_types::thread_act_t = std::ptr::null_mut();
-            let mut thread_count: u32 = 0;
-
-            // Get all threads in the task
-            let result = mach2::task::task_threads(task_port, &mut threads, &mut thread_count);
-            if result != mach2::kern_return::KERN_SUCCESS {
-                return Err(format!("task_threads failed: {:x}", result).into());
-            }
-
-            // Suspend each thread
-            for i in 0..thread_count {
-                let thread = *threads.offset(i as isize);
-                let suspend_result = mach2::thread_act::thread_suspend(thread);
-                if suspend_result == mach2::kern_return::KERN_SUCCESS {
-                    println!("Suspended thread {}", i);
-                } else {
-                    println!("Failed to suspend thread {}: {:x}", i, suspend_result);
-                }
-            }
-
-            // Clean up the threads array
-            mach2::vm::mach_vm_deallocate(
-                mach2::traps::mach_task_self(),
-                threads as u64,
-                (thread_count as usize * std::mem::size_of::<mach2::mach_types::thread_act_t>()) as u64,
-            );
-        }
-        
-        Ok(())
-    }
-    
-    pub fn suspend_threads_with_state(&mut self, thread_commands: &[ThreadCommand]) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn suspend_threads_with_state(&mut self, thread_commands: &[ThreadCommand], verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
         // Get the task port first
         let task_port = self.get_task_port()?;
         
@@ -209,7 +175,9 @@ impl ProcessController {
                 // Suspend the thread
                 let suspend_result = mach2::thread_act::thread_suspend(thread);
                 if suspend_result == mach2::kern_return::KERN_SUCCESS {
-                    println!("Suspended thread {}", i);
+                    if verbose {
+                        println!("Suspended thread {}", i);
+                    }
                 } else {
                     println!("Failed to suspend thread {}: {:x}", i, suspend_result);
                     continue;
@@ -226,7 +194,7 @@ impl ProcessController {
                         );
                         if state_result != mach2::kern_return::KERN_SUCCESS {
                             println!("Failed to set thread state for thread {}: {:x}", i, state_result);
-                        } else {
+                        } else if verbose {
                             println!("Set thread state for thread {}: flavor=0x{:x}, count={}", 
                                     i, thread_state.flavor, thread_state.count);
                         }
@@ -307,32 +275,22 @@ impl ProcessController {
         Ok(())
     }
     
-    pub fn map_segments(&mut self, segments: &[SegmentInfo], _coredump_fd: RawFd, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
-        // Get the task port first
+    pub fn map_segments(&mut self, segments: &[SegmentInfo], coredump_mmap: &MmapMut, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
         let task_port = self.get_task_port()?;
         
         for segment in segments {
             unsafe {
-                // Step 1: mmap the segment in the parent process from the coredump file
-                // We only need PROT_NONE since we're just getting the memory object handle
-                let parent_mapped = libc::mmap(
-                    std::ptr::null_mut(),
-                    segment.vm_size as usize,
-                    libc::PROT_NONE,  // No access needed in parent
-                    libc::MAP_PRIVATE,
-                    _coredump_fd,
-                    segment.file_offset as i64,
-                );
+                // Convert segment protection to mach_vm protection
+                let mut desired_vm_prot = 0;
+                if segment.init_protection & 1 != 0 { desired_vm_prot |= VM_PROT_READ; }
+                if segment.init_protection & 2 != 0 { desired_vm_prot |= VM_PROT_WRITE; }
+                if segment.init_protection & 4 != 0 { desired_vm_prot |= VM_PROT_EXECUTE; }
+
+                // Use the existing coredump_mmap instead of creating new mappings
+                let parent_mapped = coredump_mmap.as_ptr().add(segment.file_offset as usize);
                 
-                if parent_mapped == libc::MAP_FAILED {
-                    let error = std::io::Error::last_os_error();
-                    println!("❌ Failed to mmap segment {} in parent: {}", segment.name, error);
-                    return Err(format!("Failed to mmap segment {}: {}", segment.name, error).into());
-                }
-                
-                // Step 2: Try to get the memory object backing the parent mapping
                 if verbose {
-                    println!("🔍 Parent mapped segment {} at 0x{:x}, size: 0x{:x}, fd offset: 0x{:x}", 
+                    println!("🔍 Using coredump mmap for segment {} at 0x{:x}, size: 0x{:x}, fd offset: 0x{:x}", 
                             segment.name, parent_mapped as u64, segment.vm_size, segment.file_offset);
                 }
                 
@@ -340,125 +298,42 @@ impl ProcessController {
                 let mut child_mapped_address = segment.vm_address;
                 
                 // Convert protection flags from segment to mach_vm protection
-                let mut cur_protection = 0;
-                if segment.init_protection & 1 != 0 { cur_protection |= VM_PROT_READ; }
-                if segment.init_protection & 2 != 0 { cur_protection |= VM_PROT_WRITE; }
-                if segment.init_protection & 4 != 0 { cur_protection |= VM_PROT_EXECUTE; }
+                let mut cur_protection = desired_vm_prot;
                 let mut max_protection = cur_protection;
                 
-                // Retry loop for handling address conflicts
-                let mut remap_kr;
-                let max_retries = 10;
-                let mut retry_count = 0;
-                
-                loop {
-                    child_mapped_address = segment.vm_address; // Reset address each retry
-                    cur_protection = if segment.init_protection & 1 != 0 { VM_PROT_READ } else { 0 } |
-                                   if segment.init_protection & 2 != 0 { VM_PROT_WRITE } else { 0 } |
-                                   if segment.init_protection & 4 != 0 { VM_PROT_EXECUTE } else { 0 };
-                    max_protection = cur_protection;
-                    
-                    remap_kr = mach_vm_remap(
-                        task_port,                    // target_task (child)
-                        &mut child_mapped_address,    // target_address
-                        segment.vm_size,              // size
-                        0,                            // mask
-                        0,                            // anywhere
-                        mach_task_self(),             // src_task (parent)
-                        parent_mapped as u64,         // src_address
-                        1,                            // copy (COW)
-                        &mut cur_protection,          // cur_protection
-                        &mut max_protection,          // max_protection
-                        VM_INHERIT_SHARE,             // inheritance
-                    );
-                    
-                    // If remap succeeded or we've exceeded retry limit, break
-                    if remap_kr == KERN_SUCCESS || retry_count >= max_retries {
-                        break;
-                    }
-                    
-                    // If remap failed with KERN_INVALID_ADDRESS, try to clear conflicting regions
-                    if remap_kr == KERN_INVALID_ADDRESS {
-                        println!("🔍 Investigating KERN_INVALID_ADDRESS for address 0x{:x} (retry {})", segment.vm_address, retry_count + 1);
-                        
-                        // Try to get region info for the target address in the child process
-                        let mut probe_address = segment.vm_address;
-                        let mut probe_size: u64 = 0;
-                        let mut probe_info: vm_region_basic_info_64 = mem::zeroed();
-                        let mut probe_info_count = vm_region_basic_info_64::count();
-                        let mut probe_object_name: mach_port_t = 0;
-                        
-                        let probe_kr = mach_vm_region(
-                            task_port,
-                            &mut probe_address,
-                            &mut probe_size,
-                            VM_REGION_BASIC_INFO_64 as i32,
-                            &mut probe_info as *mut _ as *mut i32,
-                            &mut probe_info_count,
-                            &mut probe_object_name,
-                        );
-                        
-                        if probe_kr == KERN_SUCCESS {
-                            println!("🔍 Found region at 0x{:x}, size: 0x{:x}, protection: 0x{:x}, max_protection: 0x{:x}", 
-                                    probe_address, probe_size, probe_info.protection, probe_info.max_protection);
-                            
-                            // Check if this region overlaps with our desired mapping
-                            let region_end = probe_address + probe_size;
-                            let segment_end = segment.vm_address + segment.vm_size;
-                            
-                            if probe_address < segment_end && region_end > segment.vm_address {
-                                println!("🗑️  Found conflicting region, deallocating at 0x{:x}, size: 0x{:x}", 
-                                        probe_address, probe_size);
-                                
-                                let dealloc_kr = mach_vm_deallocate(task_port, probe_address, probe_size);
-                                if dealloc_kr == KERN_SUCCESS {
-                                    println!("✅ Successfully deallocated conflicting region");
-                                } else {
-                                    println!("⚠️  Failed to deallocate conflicting region: error 0x{:x}", dealloc_kr);
-                                    break; // Can't make progress, exit retry loop
-                                }
-                            } else {
-                                println!("🔍 Region doesn't overlap with desired mapping area");
-                                break; // No overlapping region found, no point in retrying
-                            }
-                        } else {
-                            println!("🔍 No region found at or after 0x{:x}: error 0x{:x}", 
-                                    segment.vm_address, probe_kr);
-                            break; // No region to clear, exit retry loop
-                        }
-                    } else {
-                        // Different error, don't retry
-                        break;
-                    }
-                    
-                    retry_count += 1;
-                }
-                
+                let mut remap_kr = mach_vm_remap(
+                    task_port,                    // target_task (child)
+                    &mut child_mapped_address,    // target_address
+                    segment.vm_size,              // size
+                    0,                            // mask
+                    VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                    mach_task_self(),             // src_task (parent)
+                    parent_mapped as u64,         // src_address
+                    1,                            // copy (COW)
+                    &mut cur_protection,          // cur_protection
+                    &mut max_protection,          // max_protection
+                    VM_INHERIT_SHARE,             // inheritance
+                );
+
                 if remap_kr == KERN_SUCCESS {
-                    // Convert segment protection to mach_vm protection for comparison
-                    let mut desired_vm_prot = 0;
-                    if segment.init_protection & 1 != 0 { desired_vm_prot |= VM_PROT_READ; }
-                    if segment.init_protection & 2 != 0 { desired_vm_prot |= VM_PROT_WRITE; }
-                    if segment.init_protection & 4 != 0 { desired_vm_prot |= VM_PROT_EXECUTE; }
-                    
                     // Adjust protection if it doesn't match desired
                     if cur_protection != desired_vm_prot {
-                        let protect_kr = mach_vm_protect(
+                        remap_kr = mach_vm_protect(
                             task_port,
                             child_mapped_address,
                             segment.vm_size,
                             0, // set_maximum = false
                             desired_vm_prot,
                         );
-                        if protect_kr == KERN_SUCCESS {
+                        if remap_kr == KERN_SUCCESS {
                             cur_protection = desired_vm_prot; // Update for debug print
                         } else {
                             println!("⚠️  Failed to adjust protection for segment {}: error 0x{:x}", 
-                                    segment.name, protect_kr);
+                                    segment.name, remap_kr);
                         }
                     }
                     
-                    if verbose {
+                    if verbose || remap_kr != KERN_SUCCESS {
                         // Debug: Print protection info after remap
                         let desired_prot = if segment.init_protection & 1 != 0 { "R" } else { "-" }.to_string() +
                                           if segment.init_protection & 2 != 0 { "W" } else { "-" } +
@@ -477,12 +352,11 @@ impl ProcessController {
                                 segment.name, child_mapped_address, segment.vm_address, segment.vm_size);
                     }
                 } else {
-                    println!("⚠️  Failed to remap segment {} at 0x{:x}: error 0x{:x}", 
-                            segment.name, segment.vm_address, remap_kr);
+                    println!("⚠️  Failed to remap segment {} from 0x{:x} at 0x{:x}-0x{:x}: size: 0x{:x}, error 0x{:x}", 
+                            segment.name, parent_mapped as u64, segment.vm_address, segment.vm_address + segment.vm_size, segment.vm_size, remap_kr);
                 }
                 
-                // Step 5: munmap the parent mapping
-                libc::munmap(parent_mapped, segment.vm_size as usize);
+                // No need to munmap since we're using the shared coredump_mmap
             }
         }
         
