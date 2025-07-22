@@ -24,11 +24,7 @@ impl MemoryManager {
 
     pub fn unmap_all_memory(&self) -> Result<(), Box<dyn std::error::Error>> {
         unsafe {
-            let result = mach_vm_deallocate(
-                self.task_port,
-                0,
-                mach_vm_size_t::MAX,
-            );
+            let result = mach_vm_deallocate(self.task_port, 0, mach_vm_size_t::MAX);
 
             if result != KERN_SUCCESS {
                 return Err(format!("Failed to deallocate memory: {}", result).into());
@@ -64,14 +60,16 @@ impl MemoryManager {
             if file_mapping == libc::MAP_FAILED {
                 return Err(format!(
                     "Failed to mmap segment '{}' from file: {}",
-                    segment.name, std::io::Error::last_os_error()
-                ).into());
+                    segment.name,
+                    std::io::Error::last_os_error()
+                )
+                .into());
             }
 
             // Step 2: Create a memory entry from the mapped region
             let mut memory_entry: mach_port_t = 0;
             let mut entry_size = segment.file_size as mach_vm_size_t;
-            
+
             let entry_result = mach_make_memory_entry_64(
                 mach2::traps::mach_task_self(),
                 &mut entry_size,
@@ -86,7 +84,8 @@ impl MemoryManager {
                 return Err(format!(
                     "Failed to create memory entry for segment '{}': {}",
                     segment.name, entry_result
-                ).into());
+                )
+                .into());
             }
 
             // Step 3: Map the memory entry into the target process
@@ -95,17 +94,17 @@ impl MemoryManager {
             let max_protection = self.convert_protection(segment.max_protection);
 
             let map_result = mach_vm_map(
-                self.task_port,          // target task
-                &mut target_address,     // address (in/out)
+                self.task_port,                    // target task
+                &mut target_address,               // address (in/out)
                 segment.vm_size as mach_vm_size_t, // size
-                0,                       // mask
-                0,                       // flags (use exact address)
-                memory_entry,            // object (memory entry)
-                0,                       // offset in object
-                0,                       // copy (0 = MAP_PRIVATE equivalent)
-                protection,              // current protection
-                max_protection,          // max protection
-                VM_INHERIT_COPY,         // inheritance
+                0,                                 // mask
+                0,                                 // flags (use exact address)
+                memory_entry,                      // object (memory entry)
+                0,                                 // offset in object
+                0,                                 // copy (0 = MAP_PRIVATE equivalent)
+                protection,                        // current protection
+                max_protection,                    // max protection
+                VM_INHERIT_COPY,                   // inheritance
             );
 
             // Clean up the memory entry port
@@ -118,14 +117,16 @@ impl MemoryManager {
                 return Err(format!(
                     "Failed to map segment '{}' into target process at address 0x{:x}: {}",
                     segment.name, segment.vm_address, map_result
-                ).into());
+                )
+                .into());
             }
 
             if target_address != segment.vm_address as mach_vm_address_t {
                 return Err(format!(
                     "Segment '{}' mapped at wrong address: expected 0x{:x}, got 0x{:x}",
                     segment.name, segment.vm_address, target_address
-                ).into());
+                )
+                .into());
             }
         }
 
@@ -134,7 +135,7 @@ impl MemoryManager {
 
     fn convert_protection(&self, prot: u32) -> i32 {
         let mut vm_prot = 0;
-        
+
         if prot & 0x1 != 0 {
             vm_prot |= VM_PROT_READ;
         }
@@ -149,7 +150,6 @@ impl MemoryManager {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,17 +157,26 @@ mod tests {
     #[test]
     fn test_protection_conversion() {
         let manager = MemoryManager::new(0, 0);
-        
+
         // Test read-only
         assert_eq!(manager.convert_protection(0x1), VM_PROT_READ);
-        
+
         // Test read-write
-        assert_eq!(manager.convert_protection(0x3), VM_PROT_READ | VM_PROT_WRITE);
-        
+        assert_eq!(
+            manager.convert_protection(0x3),
+            VM_PROT_READ | VM_PROT_WRITE
+        );
+
         // Test read-execute
-        assert_eq!(manager.convert_protection(0x5), VM_PROT_READ | VM_PROT_EXECUTE);
-        
+        assert_eq!(
+            manager.convert_protection(0x5),
+            VM_PROT_READ | VM_PROT_EXECUTE
+        );
+
         // Test read-write-execute
-        assert_eq!(manager.convert_protection(0x7), VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+        assert_eq!(
+            manager.convert_protection(0x7),
+            VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE
+        );
     }
 }

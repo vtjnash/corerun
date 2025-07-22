@@ -65,18 +65,18 @@ Found 219 segments:
    - addr: 0x102d48000, size: 0x4000, offset: 0x34000, prot: max=0x7 init=0x0
    - addr: 0x102d4c000, size: 0x8000, offset: 0x38000, prot: max=0x7 init=0x3
    ...
-   
+
 Found 13 thread commands:
   Thread command 0: 2 thread states
   State 0:
     State: flavor=0x6 (ARM_THREAD_STATE64), count=68, data_len=272
-      Data: 00000000 00000000 17c67170 00000001 119ff6f8 00000001 119fee44 00000001 
-            00000000 00000000 00000000 00000000 00000001 00000000 00000000 00000000 
+      Data: 00000000 00000000 17c67170 00000001 119ff6f8 00000001 119fee44 00000001
+            00000000 00000000 00000000 00000000 00000001 00000000 00000000 00000000
             ...
   State 1:
     State: flavor=0x7 (ARM_EXCEPTION_STATE64), count=4, data_len=16
       Data: 00000000 00000000 92000006 00000000
-      
+
 Spawning target process...
 Launching 13 threads in target process...
 Retrieving task port...
@@ -120,7 +120,7 @@ corerun uses a sophisticated multi-process architecture:
 ### Key Components
 
 - **Core File Parser**: Handles both MachO and ELF formats with proper segment and thread state parsing
-- **Process Controller**: Manages the target process lifecycle and IPC communication  
+- **Process Controller**: Manages the target process lifecycle and IPC communication
 - **Memory Manager**: Advanced memory mapping with conflict resolution and protection handling
 - **Task Port Exchange**: Secure bootstrap-based IPC for task port acquisition
 
@@ -128,7 +128,7 @@ corerun uses a sophisticated multi-process architecture:
 
 Protection flags are displayed in verbose mode:
 - `R--`: Read-only (0x1)
-- `-W-`: Write-only (0x2) 
+- `-W-`: Write-only (0x2)
 - `--X`: Execute-only (0x4)
 - `RW-`: Read+Write (0x3)
 - `R-X`: Read+Execute (0x5)
