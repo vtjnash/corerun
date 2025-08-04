@@ -246,10 +246,14 @@ fn main() {
 
     println!("Successfully recreated process memory from coredump!");
     println!("Target process PID: {}", process_controller.get_pid());
-    println!("Process is suspended - you can now attach a debugger or analyze it");
+    println!("Process is suspended in background - you can now attach a debugger or analyze it");
 
     // Wait for the target process to exit
     println!("Waiting for target process to exit...");
+    if let Err(e) = process_controller.wait_for_port_death() {
+        eprintln!("Error: Failed to wait_for_port_death: {}", e);
+        process::exit(1);
+    }
     match process_controller.wait() {
         Ok(exit_status) => {
             println!("Target process exited with status: {:?}", exit_status);

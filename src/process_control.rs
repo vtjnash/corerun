@@ -3,8 +3,8 @@ use command_fds::{CommandFdExt, FdMapping};
 use mach2::kern_return::KERN_SUCCESS;
 use mach2::mach_port::{mach_port_allocate, mach_port_deallocate, mach_port_insert_right};
 use mach2::message::{
-    MACH_MSG_TIMEOUT_NONE, MACH_MSG_TYPE_MAKE_SEND, MACH_RCV_MSG, mach_msg, mach_msg_body_t,
-    mach_msg_header_t, mach_msg_port_descriptor_t, mach_msg_trailer_t,
+    MACH_MSG_TIMEOUT_NONE, MACH_MSG_TYPE_MAKE_SEND, MACH_MSG_TYPE_MAKE_SEND_ONCE, MACH_RCV_MSG,
+    mach_msg, mach_msg_body_t, mach_msg_header_t, mach_msg_port_descriptor_t, mach_msg_trailer_t,
 };
 use mach2::port::{MACH_PORT_NULL, MACH_PORT_RIGHT_RECEIVE, mach_port_t};
 use mach2::task::{TASK_BOOTSTRAP_PORT, task_get_special_port};
@@ -644,6 +644,128 @@ impl ProcessController {
         self.cached_task_port = Some(MachPort(child_task_port));
 
         Ok(child_task_port)
+    }
+
+    /// Wait for the cached task port to become disconnected (receive end closed).
+    /// This happens when the target process exits or crashes.
+    ///
+    /// Returns Ok(()) when the port is disconnected, or an error if:
+    /// - No task port is cached
+    /// - The wait operation fails
+    pub fn wait_for_port_death(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // Get the cached task port
+        let task_port = match &self.cached_task_port {
+            Some(port) => port.0,
+            None => return Err("No cached task port available".into()),
+        };
+
+        unsafe {
+            // Create a port set and add the task port to monitor it
+            unsafe extern "C" {
+                fn mach_port_request_notification(
+                    task: mach_port_t,
+                    name: mach_port_t,
+                    msgid: i32,
+                    sync: u32,
+                    notify: mach_port_t,
+                    notifyPoly: u32,
+                    previous: *mut mach_port_t,
+                ) -> i32;
+            }
+
+            // Allocate a port to receive notifications
+            let mut notify_port: mach_port_t = 0;
+            let kr =
+                mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &mut notify_port);
+            if kr != KERN_SUCCESS {
+                return Err(format!("Failed to allocate notification port: 0x{:x}", kr).into());
+            }
+            let _notify_port_guard = MachPort(notify_port);
+
+            // Request dead name notification
+            const MACH_NOTIFY_DEAD_NAME: i32 = 72; // From mach/notify.h
+            let mut previous_port: mach_port_t = MACH_PORT_NULL;
+
+            let kr = mach_port_request_notification(
+                mach_task_self(),
+                task_port,
+                MACH_NOTIFY_DEAD_NAME,
+                0, // sync
+                notify_port,
+                MACH_MSG_TYPE_MAKE_SEND_ONCE as u32,
+                &mut previous_port,
+            );
+
+            if kr != KERN_SUCCESS {
+                return Err(format!("Failed to request dead name notification: 0x{:x}", kr).into());
+            }
+
+            // Wait for the notification message
+            // Dead name notification structure from mach/notify.h
+            #[repr(C)]
+            struct mach_dead_name_notification_t {
+                header: mach_msg_header_t,
+                ndr: NDR_record_t,
+                name: mach_port_t,
+                trailer: mach_msg_trailer_t,
+            }
+
+            #[repr(C)]
+            #[derive(Copy, Clone)]
+            struct NDR_record_t {
+                mig_vers: u8,
+                if_vers: u8,
+                reserved1: u8,
+                mig_encoding: u8,
+                int_rep: u8,
+                char_rep: u8,
+                float_rep: u8,
+                reserved2: u8,
+            }
+
+            impl Default for NDR_record_t {
+                fn default() -> Self {
+                    NDR_record_t {
+                        mig_vers: 0,
+                        if_vers: 0,
+                        reserved1: 0,
+                        mig_encoding: 0,
+                        int_rep: 1,   // NDR_INT_LITTLE_ENDIAN
+                        char_rep: 0,  // NDR_CHAR_ASCII
+                        float_rep: 1, // NDR_FLOAT_IEEE
+                        reserved2: 0,
+                    }
+                }
+            }
+
+            let mut msg: mach_dead_name_notification_t = mem::zeroed();
+            msg.ndr = NDR_record_t::default();
+
+            let kr = mach_msg(
+                &mut msg.header,
+                MACH_RCV_MSG,
+                0,
+                mem::size_of::<mach_dead_name_notification_t>() as u32,
+                notify_port,
+                MACH_MSG_TIMEOUT_NONE,
+                MACH_PORT_NULL,
+            );
+
+            if kr != KERN_SUCCESS {
+                return Err(format!("Failed to receive notification: 0x{:x}", kr).into());
+            }
+
+            // Check if this is a dead name notification
+            if msg.header.msgh_id == MACH_NOTIFY_DEAD_NAME {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Received unexpected notification: {} (expected {})",
+                    msg.header.msgh_id, MACH_NOTIFY_DEAD_NAME
+                )
+                .into())
+            }
+        }
     }
 
     pub fn get_pid(&self) -> u32 {
