@@ -216,8 +216,8 @@ impl ProcessController {
                         );
                         if state_result != mach2::kern_return::KERN_SUCCESS {
                             println!(
-                                "Failed to set thread state for thread {}: {:x}",
-                                i, state_result
+                                "Failed to set thread state for thread {}: flavor=0x{:x} error={:x}",
+                                i, thread_state.flavor, state_result
                             );
                         } else if verbose {
                             println!(

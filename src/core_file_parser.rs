@@ -1,11 +1,8 @@
+use crate::mach2_thread_status::*;
 use object::elf::{NT_FPREGSET, NT_PRSTATUS};
 use object::read::elf::ProgramHeader;
 use object::read::macho::LoadCommandVariant;
-use object::{Object, ObjectSegment, SegmentFlags};
-
-// ARM thread state constants
-const ARM_THREAD_STATE64: u32 = 6;
-const ARM_EXCEPTION_STATE64: u32 = 7;
+use object::{Object, ObjectSegment, SegmentFlags, Architecture};
 
 #[derive(Debug, Clone)]
 pub struct SegmentInfo {
@@ -294,10 +291,15 @@ impl<'data> CoreFileParser<'data> {
     pub fn format_thread_state_verbose(&self, thread_state: &ThreadState) -> String {
         let mut output = String::new();
 
+        let arch = self.object.architecture();
+
         // Detect ARM thread state types
-        let state_type = match thread_state.flavor {
-            ARM_THREAD_STATE64 => " (ARM_THREAD_STATE64)",
-            ARM_EXCEPTION_STATE64 => " (ARM_EXCEPTION_STATE64)",
+        let state_type = match (arch, thread_state.flavor) {
+            (Architecture::Aarch64, ARM_THREAD_STATE64) => " (ARM_THREAD_STATE64)",
+            (Architecture::Aarch64, ARM_EXCEPTION_STATE64) => " (ARM_EXCEPTION_STATE64)",
+            (Architecture::X86_64, x86_THREAD_STATE) => " (x86_THREAD_STATE)",
+            (Architecture::X86_64, x86_FLOAT_STATE) => " (x86_FLOAT_STATE)",
+            (Architecture::X86_64, x86_EXCEPTION_STATE) => " (x86_EXCEPTION_STATE)",
             _ => "",
         };
 

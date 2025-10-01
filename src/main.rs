@@ -4,6 +4,7 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::process;
 
+pub mod mach2_thread_status;
 pub mod core_file_parser;
 pub mod memory_manager;
 pub mod process_control;
