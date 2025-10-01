@@ -330,15 +330,15 @@ impl ProcessController {
 
             let parent_mapped = unsafe { coredump_mmap.as_ptr().add(segment.file_offset as usize) };
 
+            // Use mach_vm_remap to directly remap from parent to child
+            let mut child_mapped_address = segment.vm_address;
+
             if verbose {
                 println!(
                     "🔍 Using coredump mmap for segment {} at 0x{:x}, size: 0x{:x}, fd offset: 0x{:x}",
-                    segment.name, parent_mapped as u64, segment.vm_size, segment.file_offset
+                    segment.name, child_mapped_address as u64, segment.vm_size, segment.file_offset
                 );
             }
-
-            // Use mach_vm_remap to directly remap from parent to child
-            let mut child_mapped_address = segment.vm_address;
 
             // Convert protection flags from segment to mach_vm protection
             let mut cur_protection = desired_vm_prot;

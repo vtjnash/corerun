@@ -166,9 +166,7 @@ fn main() {
     }
 
     let child_pid = process_controller.get_pid();
-    if verbose {
-        println!("Target process spawned with PID: {}", child_pid);
-    }
+    println!("Target process spawned with PID: {}", child_pid);
 
     // Get task port - this will now work with the full IPC implementation
     match process_controller.get_task_port() {
